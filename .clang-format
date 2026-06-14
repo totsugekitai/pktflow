@@ -1,0 +1,27 @@
+BasedOnStyle: Google
+IndentWidth: 8
+ContinuationIndentWidth: 8
+ColumnLimit: 79
+BinPackParameters: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignAfterOpenBracket: AlwaysBreak
+
+IncludeBlocks: Regroup
+SortIncludes: true
+
+IncludeCategories:
+  # System headers
+  - Regex: '^<(arpa|errno|fcntl|net|netinet|pthread|signal|stdio|stdlib|stdint|stddef|string|sys|time|unistd).*\.h>$'
+    Priority: 1
+
+  # DPDK headers
+  - Regex: '^<(generic/rte|rte)_.*>$'
+    Priority: 2
+
+  # Other system headers
+  - Regex: '^<.*>$'
+    Priority: 3
+
+  # Project headers
+  - Regex: '^".*"'
+    Priority: 4

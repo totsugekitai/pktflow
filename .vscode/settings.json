@@ -1,0 +1,21 @@
+{
+    "editor.formatOnSave": true,
+    "files.insertFinalNewline": true,
+    "files.associations": {
+        "*.h": "c",
+        "*.json": "json",
+        ".clang*": "yaml"
+    },
+    "[c]": {
+        "editor.indentSize": "tabSize",
+        "editor.tabSize": 8,
+    },
+    "[json]": {
+        "editor.quickSuggestions": {
+            "strings": true
+        },
+        "editor.suggest.insertMode": "replace",
+        "editor.indentSize": "tabSize",
+        "editor.tabSize": 2
+    }
+}

@@ -1,0 +1,8 @@
+# Daemon mode: the process starts idle; ports and workers are managed
+# through the REST API. Run with: bash run.sh --daemon -c sample_daemon_config.toml
+[dpdk]
+lcores = "11-17"
+
+[daemon]
+listen = "0.0.0.0:7878" # optional: REST API listen address (default shown)
+# pcap_dir = "/tmp"       # optional: capture spool directory (default: temp dir)

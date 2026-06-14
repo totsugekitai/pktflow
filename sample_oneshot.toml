@@ -1,0 +1,47 @@
+[dpdk]
+lcores = "11-17"
+# memory_mb = 1024
+
+[[dpdk.ports]]
+pci = "0000:02:00.0"
+rxq = 1
+txq = 1
+apps = ["pktgen"]
+
+[[dpdk.ports]]
+pci = "0000:02:00.1"
+rxq = 1
+txq = 1
+apps = ["pcap"]
+
+[[tx.streams]]
+protocol = "ipv4"             # "arp" | "ipv4" | "ipv6"
+src_mac = "00:11:22:33:44:55"
+dst_mac = "66:77:88:99:aa:bb"
+src_ip = "10.0.0.1"
+dst_ip = "10.0.0.2"
+count = 1000                  # optional: number of frames to send (default 1)
+# vlan = 100               # optional: insert 802.1Q tag with this VID
+# payload_len = 64         # optional: dummy payload length (default 64)
+# ttl = 64                 # optional (ipv4)
+# l4_protocol = 253        # optional: IPv4 protocol / IPv6 next header
+
+[[tx.streams]]
+protocol = "arp"
+# arp_op = "request"       # optional: "request" | "reply" (default "request")
+src_mac = "00:11:22:33:44:55"
+dst_mac = "ff:ff:ff:ff:ff:ff"
+src_ip = "10.0.0.1"
+dst_ip = "10.0.0.2"
+
+[[tx.streams]]
+protocol = "ipv6"
+vlan = 100
+src_mac = "00:11:22:33:44:55"
+dst_mac = "66:77:88:99:aa:bb"
+src_ip = "2001:db8::1"
+dst_ip = "2001:db8::2"
+# hop_limit = 64           # optional (ipv6)
+
+[capture]
+file = "rx.pcapng" # write received frames to this pcapng file
