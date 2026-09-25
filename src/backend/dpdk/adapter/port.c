@@ -133,12 +133,15 @@ int dpdk_port_get_link(const dpdk_port_t *p, int *link_up) {
 }
 
 int dpdk_port_wait_linkup(dpdk_port_t *p) {
+        int ret;
         struct rte_eth_dev_info info;
         struct rte_eth_link link;
 
         for (int i = 0; i < 1000; i++) {
-                rte_eth_dev_info_get(p->port_id, &info);
-                rte_eth_link_get(p->port_id, &link);
+                ret = rte_eth_dev_info_get(p->port_id, &info);
+                if (ret) return ret;
+                ret = rte_eth_link_get(p->port_id, &link);
+                if (ret) return ret;
                 if (info.device != nullptr &&
                     link.link_status == RTE_ETH_LINK_UP) {
                         return 0;
