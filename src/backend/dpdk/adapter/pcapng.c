@@ -36,7 +36,7 @@ void dpdk_pcapng_close(dpdk_pcapng_t *p) {
 
 int dpdk_pcapng_add_interface(dpdk_pcapng_t *p, uint16_t port_id) {
         return rte_pcapng_add_interface(
-                p->pcapng, port_id, nullptr, nullptr, nullptr);
+                p->pcapng, port_id, DLT_EN10MB, nullptr, nullptr, nullptr);
 }
 
 uint32_t dpdk_pcapng_mbuf_size(uint32_t length) {
