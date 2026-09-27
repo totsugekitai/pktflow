@@ -15,7 +15,12 @@ use crate::{
     },
     config::Config,
     worker::{
-        StopFlag, log::LogWorker, pcap::PcapWorker, rx::RxWorker, stats::PortCounters, tx::TxWorker,
+        StopFlag,
+        log::LogWorker,
+        pcap::PcapWorker,
+        rx::RxWorker,
+        stats::PortCounters,
+        tx::{TxCount, TxPattern, TxWorker},
     },
 };
 
@@ -119,9 +124,14 @@ fn run(backend: &mut DpdkBackend, config: &Config) -> Result<()> {
     // unsignaled for the whole run.
     let tx_counters = Arc::new(PortCounters::new());
     let rx_counters = Arc::new(PortCounters::new());
+    let tx_patterns = config
+        .tx_streams
+        .iter()
+        .map(|s| TxPattern::single(s.build_frame(), TxCount::Fixed(s.count), s.rate))
+        .collect();
     let tx_handle = backend.spawn(TxWorker::new(
         tx_port.clone(),
-        config.tx_streams.clone(),
+        tx_patterns,
         StopFlag::new(),
         tx_counters.clone(),
     ))?;
