@@ -233,6 +233,10 @@ struct Daemon {
 
 impl Daemon {
     fn execute(&mut self, backend: &mut DpdkBackend, cmd: Command) -> Result<Reply> {
+        // Reclaim workers that finished on their own (e.g. a fixed_packets
+        // flow that sent everything) before any command, so read-only ones
+        // like `GetMetrics` never report them as still running.
+        self.reap_finished(backend);
         match cmd {
             Command::SetConfig(config) => self.set_config(backend, config),
             Command::GetConfig => Ok(self.get_config()),
@@ -244,6 +248,13 @@ impl Daemon {
                 sdk_version: env!("CARGO_PKG_VERSION").into(),
                 app_version: env!("CARGO_PKG_VERSION").into(),
             })),
+        }
+    }
+
+    /// Reaps finished Tx/capture workers on every port.
+    fn reap_finished(&mut self, backend: &mut DpdkBackend) {
+        for entry in self.ports.values_mut() {
+            entry.reap_finished(backend);
         }
     }
 
