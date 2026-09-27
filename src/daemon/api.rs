@@ -1,45 +1,51 @@
-//! REST API front-end for daemon mode. Runs on a plain OS thread; each
-//! request is translated into a [`Command`](super::Command) and executed
-//! by the daemon loop, so this layer never touches DPDK itself.
+//! REST API front-end for daemon mode, implementing the subset of the
+//! Open Traffic Generator (OTG) REST API pktflow supports. Runs on a
+//! plain OS thread; each request is translated into a
+//! [`Command`](super::Command) and executed by the daemon loop, so
+//! this layer never touches DPDK itself.
 //!
-//! Endpoints (all bodies are JSON):
-//! - `GET    /ports`                   list ports with their link status
-//!   and task states
-//! - `POST   /ports`                   `{pci, rxq?, txq?, mode?}` add a port
-//! - `DELETE /ports/<pci>`             remove an idle port
-//! - `PUT    /ports/<pci>/mode`        `{tx?, rx?, pcap?}` set the mode
-//! - `POST   /ports/<pci>/tx/start`    `{streams: [...]}` (same fields as
-//!   `[[tx.streams]]` in the config file)
-//! - `POST   /ports/<pci>/tx/stop`
-//! - `POST   /ports/<pci>/rx/start`
-//! - `POST   /ports/<pci>/rx/stop`
-//! - `POST   /ports/<pci>/pcap/start`
-//! - `POST   /ports/<pci>/pcap/stop`
-//! - `GET    /ports/<pci>/pcap`        download the finished capture
-//! - `GET    /ports/<pci>/stats`       hardware and software counters
+//! Endpoints (all bodies are JSON; see `artifacts/openapi.yaml` in
+//! open-traffic-generator/models for the full schema):
+//! - `POST /config`               sets the whole configuration
+//! - `GET  /config`               returns the current configuration
+//! - `POST /control/state`        `choice`: `port` (`link`/`capture`)
+//!   or `traffic` (`flow_transmit`)
+//! - `POST /monitor/metrics`      `choice`: `port` or `flow`
+//! - `POST /monitor/capture`      stops the port's capture (if
+//!   running) and returns the pcapng bytes
+//! - `GET  /capabilities/version`
+//!
+//! `PATCH /config` (update/append/delete), `POST /control/action`,
+//! `POST /monitor/states` and `protocol` control state are not
+//! implemented; see `TODO.md`.
 
 use std::{io::Read, sync::mpsc, thread, time::Duration};
 
 use anyhow::{Context as aContext, Result, anyhow};
-use serde::Deserialize;
-use serde_json::json;
 use tiny_http::{Header, Method, Response, Server};
 use tracing::{debug, warn};
 
 use crate::{
-    config::Stream,
-    daemon::{CmdResult, Command, PortMode, Reply, Request},
+    daemon::{
+        CmdResult, Command, Reply, Request,
+        otg::model::{
+            CaptureRequest, Config, ControlAction, ControlState, ErrorBody, MetricsRequest,
+            MetricsSelector, Warning,
+        },
+    },
     worker::StopFlag,
 };
 
 /// How long `recv_timeout` blocks before re-checking the stop flag.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Upper bound on accepted request bodies; a stream list is small.
+/// Upper bound on accepted request bodies.
 const MAX_BODY_LEN: u64 = 1 << 20;
 
-/// A failure to answer with, mapped onto an HTTP status code.
+/// A failure to answer with, mapped onto an HTTP status code and the
+/// OTG `Error` schema (`{code, kind, errors}`).
 struct ApiError {
     status: u16,
+    kind: &'static str,
     message: String,
 }
 
@@ -47,6 +53,7 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: 400,
+            kind: "validation",
             message: message.into(),
         }
     }
@@ -54,6 +61,7 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: 404,
+            kind: "validation",
             message: message.into(),
         }
     }
@@ -62,6 +70,7 @@ impl ApiError {
     fn unavailable() -> Self {
         Self {
             status: 503,
+            kind: "internal",
             message: "daemon is shutting down".into(),
         }
     }
@@ -104,91 +113,54 @@ fn handle(mut request: tiny_http::Request, cmd_tx: &mpsc::Sender<Request>) {
     {
         respond(
             request,
-            &error_response(400, &format!("unreadable body: {e}")),
+            &error_response(400, "validation", &format!("unreadable body: {e}")),
         );
         return;
     }
 
     let path = url.split('?').next().unwrap_or("");
-    let segments: Vec<String> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(percent_decode)
-        .collect();
-    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     let outcome = route(&method, &segments, &body).and_then(|cmd| dispatch(cmd, cmd_tx));
     let response = match outcome {
-        Ok(Reply::Empty) => json_response(200, &json!({ "ok": true })),
-        Ok(Reply::Ports(ports)) => json_response(200, &json!({ "ports": ports })),
-        Ok(Reply::Stats(report)) => json_response(200, &json!(report)),
+        Ok(Reply::Empty) => json_response(200, &Warning::none()),
+        Ok(Reply::Config(config)) => json_response(200, &config),
+        Ok(Reply::Metrics(metrics)) => json_response(200, &metrics),
+        Ok(Reply::Version(version)) => json_response(200, &version),
         Ok(Reply::Pcap(data)) => HttpReply {
             status: 200,
             content_type: "application/octet-stream",
             body: data,
         },
-        Err(e) => error_response(e.status, &e.message),
+        Err(e) => error_response(e.status, e.kind, &e.message),
     };
     respond(request, &response);
 }
 
 fn route(method: &Method, segments: &[&str], body: &str) -> Result<Command, ApiError> {
     match (method, segments) {
-        (Method::Get, ["ports"]) => Ok(Command::ListPorts),
-        (Method::Post, ["ports"]) => {
-            let req: AddPortBody = parse_body(body)?;
-            Ok(Command::AddPort {
-                pci: req.pci,
-                rxq: req.rxq,
-                txq: req.txq,
-                rxd: req.rxd,
-                mode: req.mode.unwrap_or(PortMode::ALL),
-            })
+        (Method::Post, ["config"]) => {
+            let config: Config = parse_body(body)?;
+            Ok(Command::SetConfig(config))
         }
-        (Method::Delete, ["ports", pci]) => Ok(Command::RemovePort {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Put, ["ports", pci, "mode"]) => Ok(Command::SetMode {
-            pci: (*pci).to_string(),
-            mode: parse_body(body)?,
-        }),
-        (Method::Post, ["ports", pci, "tx", "start"]) => {
-            let req: TxStartBody = parse_body(body)?;
-            let streams = req
-                .streams
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    s.to_spec()
-                        .map_err(|e| ApiError::bad_request(format!("invalid stream #{i}: {e:#}")))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Command::StartTx {
-                pci: (*pci).to_string(),
-                streams,
-            })
+        (Method::Get, ["config"]) => Ok(Command::GetConfig),
+        (Method::Post, ["control", "state"]) => {
+            let state: ControlState = parse_body(body)?;
+            let action = ControlAction::try_from(state)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            Ok(Command::SetControlState(action))
         }
-        (Method::Post, ["ports", pci, "tx", "stop"]) => Ok(Command::StopTx {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Post, ["ports", pci, "rx", "start"]) => Ok(Command::StartRx {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Post, ["ports", pci, "rx", "stop"]) => Ok(Command::StopRx {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Post, ["ports", pci, "pcap", "start"]) => Ok(Command::StartPcap {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Post, ["ports", pci, "pcap", "stop"]) => Ok(Command::StopPcap {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Get, ["ports", pci, "pcap"]) => Ok(Command::GetPcap {
-            pci: (*pci).to_string(),
-        }),
-        (Method::Get, ["ports", pci, "stats"]) => Ok(Command::GetStats {
-            pci: (*pci).to_string(),
-        }),
+        (Method::Post, ["monitor", "metrics"]) => {
+            let req: MetricsRequest = parse_body(body)?;
+            let selector = MetricsSelector::try_from(req)
+                .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            Ok(Command::GetMetrics(selector))
+        }
+        (Method::Post, ["monitor", "capture"]) => {
+            let req: CaptureRequest = parse_body(body)?;
+            Ok(Command::GetCapture(req))
+        }
+        (Method::Get, ["capabilities", "version"]) => Ok(Command::GetVersion),
         _ => Err(ApiError::not_found("no such endpoint")),
     }
 }
@@ -209,32 +181,7 @@ fn dispatch(cmd: Command, cmd_tx: &mpsc::Sender<Request>) -> Result<Reply, ApiEr
     }
 }
 
-#[derive(Deserialize)]
-struct AddPortBody {
-    pci: String,
-    #[serde(default = "default_queues")]
-    rxq: u16,
-    #[serde(default = "default_queues")]
-    txq: u16,
-    #[serde(default = "default_rx_desc")]
-    rxd: u16,
-    mode: Option<PortMode>,
-}
-
-fn default_queues() -> u16 {
-    1
-}
-
-fn default_rx_desc() -> u16 {
-    crate::config::DEFAULT_RX_DESC
-}
-
-#[derive(Deserialize)]
-struct TxStartBody {
-    streams: Vec<Stream>,
-}
-
-fn parse_body<'a, T: Deserialize<'a>>(body: &'a str) -> Result<T, ApiError> {
+fn parse_body<'a, T: serde::Deserialize<'a>>(body: &'a str) -> Result<T, ApiError> {
     serde_json::from_str(body).map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))
 }
 
@@ -244,16 +191,23 @@ struct HttpReply {
     body: Vec<u8>,
 }
 
-fn json_response(status: u16, value: &serde_json::Value) -> HttpReply {
+fn json_response(status: u16, value: &impl serde::Serialize) -> HttpReply {
     HttpReply {
         status,
         content_type: "application/json",
-        body: value.to_string().into_bytes(),
+        body: serde_json::to_vec(value).expect("response types always serialize"),
     }
 }
 
-fn error_response(status: u16, message: &str) -> HttpReply {
-    json_response(status, &json!({ "error": message }))
+fn error_response(status: u16, kind: &'static str, message: &str) -> HttpReply {
+    json_response(
+        status,
+        &ErrorBody {
+            code: status,
+            kind,
+            errors: vec![message.to_string()],
+        },
+    )
 }
 
 fn respond(request: tiny_http::Request, reply: &HttpReply) {
@@ -267,159 +221,86 @@ fn respond(request: tiny_http::Request, reply: &HttpReply) {
     }
 }
 
-/// Decodes `%XX` escapes so PCI addresses survive strict URL encoders
-/// (":" is often escaped in path segments).
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let escape = if bytes[i] == b'%' && i + 2 < bytes.len() {
-            std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        } else {
-            None
-        };
-        match escape {
-            Some(b) => {
-                out.push(b);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn percent_decode_decodes_escaped_pci_address() {
-        assert_eq!(percent_decode("0000%3A02%3A00.0"), "0000:02:00.0");
+    fn routes_get_config() {
+        let cmd = route(&Method::Get, &["config"], "").unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(matches!(cmd, Command::GetConfig));
     }
 
     #[test]
-    fn percent_decode_keeps_plain_strings() {
-        assert_eq!(percent_decode("0000:02:00.0"), "0000:02:00.0");
-    }
-
-    #[test]
-    fn percent_decode_keeps_invalid_escapes() {
-        assert_eq!(percent_decode("a%zz"), "a%zz");
-        assert_eq!(percent_decode("a%"), "a%");
-    }
-
-    #[test]
-    fn routes_tx_start_with_streams() {
-        let body = r#"{"streams": [{
-            "protocol": "ipv4",
-            "src_mac": "00:11:22:33:44:55",
-            "dst_mac": "66:77:88:99:aa:bb",
-            "src_ip": "10.0.0.1",
-            "dst_ip": "10.0.0.2",
-            "count": 100
-        }]}"#;
-        let cmd = route(
-            &Method::Post,
-            &["ports", "0000:02:00.0", "tx", "start"],
-            body,
-        )
-        .unwrap_or_else(|e| panic!("{}", e.message));
-        let Command::StartTx { pci, streams } = cmd else {
-            panic!("expected StartTx");
+    fn routes_post_config_with_ports_and_flows() {
+        let body = r#"{
+            "ports": [{"name": "p1", "location": "0000:02:00.0"}],
+            "flows": [{
+                "name": "f1",
+                "tx_rx": {"choice": "port", "port": {"tx_name": "p1", "rx_names": ["p1"]}},
+                "packet": [
+                    {"choice": "ethernet", "ethernet": {
+                        "src": {"choice": "value", "value": "00:11:22:33:44:55"},
+                        "dst": {"choice": "value", "value": "66:77:88:99:aa:bb"}
+                    }},
+                    {"choice": "ipv4", "ipv4": {
+                        "src": {"choice": "value", "value": "10.0.0.1"},
+                        "dst": {"choice": "value", "value": "10.0.0.2"}
+                    }}
+                ]
+            }]
+        }"#;
+        let cmd =
+            route(&Method::Post, &["config"], body).unwrap_or_else(|e| panic!("{}", e.message));
+        let Command::SetConfig(config) = cmd else {
+            panic!("expected SetConfig");
         };
-        assert_eq!(pci, "0000:02:00.0");
-        assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].count, 100);
+        assert_eq!(config.ports.len(), 1);
+        assert_eq!(config.flows.len(), 1);
     }
 
     #[test]
-    fn rejects_invalid_stream_with_bad_request() {
-        let body = r#"{"streams": [{
-            "protocol": "vxlan",
-            "src_mac": "00:11:22:33:44:55",
-            "dst_mac": "66:77:88:99:aa:bb",
-            "src_ip": "10.0.0.1",
-            "dst_ip": "10.0.0.2"
-        }]}"#;
-        let err = route(
-            &Method::Post,
-            &["ports", "0000:02:00.0", "tx", "start"],
-            body,
-        )
-        .err()
-        .expect("must be rejected");
+    fn rejects_invalid_control_state_choice() {
+        let body = r#"{"choice": "protocol"}"#;
+        let err = route(&Method::Post, &["control", "state"], body)
+            .err()
+            .expect("must be rejected");
         assert_eq!(err.status, 400);
-        assert!(err.message.contains("unknown protocol"));
     }
 
     #[test]
-    fn routes_stats_endpoint() {
-        let cmd = route(&Method::Get, &["ports", "0000:02:00.0", "stats"], "")
+    fn routes_control_state_flow_transmit_start() {
+        let body = r#"{"choice": "traffic", "traffic": {"choice": "flow_transmit", "flow_transmit": {"flow_names": ["f1"], "state": "start"}}}"#;
+        let cmd = route(&Method::Post, &["control", "state"], body)
             .unwrap_or_else(|e| panic!("{}", e.message));
-        let Command::GetStats { pci } = cmd else {
-            panic!("expected GetStats");
+        let Command::SetControlState(ControlAction::FlowTransmit { flow_names, .. }) = cmd else {
+            panic!("expected FlowTransmit");
         };
-        assert_eq!(pci, "0000:02:00.0");
+        assert_eq!(flow_names, vec!["f1".to_string()]);
+    }
+
+    #[test]
+    fn routes_monitor_metrics_port_choice() {
+        let body = r#"{"choice": "port", "port": {"port_names": []}}"#;
+        let cmd = route(&Method::Post, &["monitor", "metrics"], body)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(matches!(cmd, Command::GetMetrics(MetricsSelector::Port(_))));
+    }
+
+    #[test]
+    fn routes_monitor_capture() {
+        let body = r#"{"port_name": "p1"}"#;
+        let cmd = route(&Method::Post, &["monitor", "capture"], body)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let Command::GetCapture(req) = cmd else {
+            panic!("expected GetCapture");
+        };
+        assert_eq!(req.port_name, "p1");
     }
 
     #[test]
     fn unknown_route_is_not_found() {
         let err = route(&Method::Get, &["nope"], "").err().expect("404");
         assert_eq!(err.status, 404);
-    }
-
-    #[test]
-    fn add_port_defaults_queues_and_mode() {
-        let cmd = route(&Method::Post, &["ports"], r#"{"pci": "0000:02:00.0"}"#)
-            .unwrap_or_else(|e| panic!("{}", e.message));
-        let Command::AddPort {
-            pci,
-            rxq,
-            txq,
-            rxd,
-            mode,
-        } = cmd
-        else {
-            panic!("expected AddPort");
-        };
-        assert_eq!(pci, "0000:02:00.0");
-        assert_eq!((rxq, txq), (1, 1));
-        assert_eq!(rxd, crate::config::DEFAULT_RX_DESC);
-        assert!(mode.tx && mode.rx && mode.pcap);
-    }
-
-    #[test]
-    fn add_port_honors_explicit_rxd() {
-        let cmd = route(
-            &Method::Post,
-            &["ports"],
-            r#"{"pci": "0000:02:00.0", "rxd": 2048}"#,
-        )
-        .unwrap_or_else(|e| panic!("{}", e.message));
-        let Command::AddPort { rxd, .. } = cmd else {
-            panic!("expected AddPort");
-        };
-        assert_eq!(rxd, 2048);
-    }
-
-    #[test]
-    fn mode_body_defaults_absent_fields_to_disabled() {
-        let cmd = route(
-            &Method::Put,
-            &["ports", "0000:02:00.0", "mode"],
-            r#"{"rx": true}"#,
-        )
-        .unwrap_or_else(|e| panic!("{}", e.message));
-        let Command::SetMode { mode, .. } = cmd else {
-            panic!("expected SetMode");
-        };
-        assert!(!mode.tx && mode.rx && !mode.pcap);
     }
 }

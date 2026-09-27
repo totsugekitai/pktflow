@@ -29,6 +29,9 @@ pub trait Port: Send + Sync {
     /// Reads the current link status without waiting for negotiation.
     /// Safe to call from any thread while workers are polling the port.
     fn link_up(&self) -> Result<bool>;
+    /// Forces the link administratively up or down. Not every PHY/driver
+    /// supports this.
+    fn set_link(&mut self, up: bool) -> Result<()>;
     /// Sends the given frames onto the wire.
     fn send_frames(&mut self, frames: &[&[u8]]) -> Result<()>;
     /// Polls once for received frames and invokes `on_frame` for each.

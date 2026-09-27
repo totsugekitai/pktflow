@@ -7,7 +7,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     backend::{Port, Worker},
-    proto::stream::StreamSpec,
+    proto::stream::Rate,
     signal,
     worker::{StopFlag, stats::PortCounters},
 };
@@ -50,9 +50,73 @@ impl Pacer {
     }
 }
 
+/// How many frames a [`TxPattern`] sends before stopping on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxCount {
+    Fixed(u64),
+    /// Runs until the worker is stopped (SIGINT or its `StopFlag`).
+    Continuous,
+}
+
+/// A precomputed cycle of on-wire frames sent at a target rate for a
+/// fixed count or continuously. One `TxPattern` corresponds to one
+/// `[[tx.streams]]` entry in one-shot mode, or one OTG `Flow` in
+/// daemon mode; every frame in `frames` has the same length.
+#[derive(Debug)]
+pub struct TxPattern {
+    frames: Vec<Vec<u8>>,
+    count: TxCount,
+    rate: Option<Rate>,
+    /// Per-flow counters, kept alongside the port-wide counters the
+    /// `TxWorker` already updates. Only used in daemon mode, where OTG
+    /// flow metrics must be reported separately from port metrics.
+    flow_counters: Option<Arc<PortCounters>>,
+}
+
+impl TxPattern {
+    /// A pattern that always sends the same, single frame (the
+    /// one-shot mode case: `StreamSpec::build_frame()` is called once
+    /// per `[[tx.streams]]` entry).
+    pub fn single(frame: Vec<u8>, count: TxCount, rate: Option<Rate>) -> Self {
+        Self {
+            frames: vec![frame],
+            count,
+            rate,
+            flow_counters: None,
+        }
+    }
+
+    /// A pattern that cycles through several precomputed frame
+    /// variants (daemon mode: an OTG Flow whose header fields vary
+    /// across packets). All `frames` must have the same length.
+    pub fn cycle(
+        frames: Vec<Vec<u8>>,
+        count: TxCount,
+        rate: Option<Rate>,
+        flow_counters: Arc<PortCounters>,
+    ) -> Self {
+        Self {
+            frames,
+            count,
+            rate,
+            flow_counters: Some(flow_counters),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[cfg(test)]
+    pub fn frame_at(&self, i: usize) -> &[u8] {
+        self.frames[i].as_slice()
+    }
+}
+
 pub struct TxWorker<P: Port> {
     port: Arc<RwLock<P>>,
-    streams: Vec<StreamSpec>,
+    patterns: Vec<TxPattern>,
     stop: StopFlag,
     counters: Arc<PortCounters>,
 }
@@ -60,13 +124,13 @@ pub struct TxWorker<P: Port> {
 impl<P: Port> TxWorker<P> {
     pub fn new(
         port: Arc<RwLock<P>>,
-        streams: Vec<StreamSpec>,
+        patterns: Vec<TxPattern>,
         stop: StopFlag,
         counters: Arc<PortCounters>,
     ) -> Self {
         Self {
             port,
-            streams,
+            patterns,
             stop,
             counters,
         }
@@ -76,34 +140,58 @@ impl<P: Port> TxWorker<P> {
 impl<P: Port> Worker for TxWorker<P> {
     fn run(&self) {
         debug!("Tx worker running.");
-        if self.streams.is_empty() {
-            warn!("No [[tx.streams]] configured, nothing to send.");
+        if self.patterns.is_empty() {
+            warn!("No streams/flows configured, nothing to send.");
             return;
         }
         let mut total: u64 = 0;
-        for (i, stream) in self.streams.iter().enumerate() {
-            let frame = stream.build_frame();
-            let burst = vec![frame.as_slice(); BURST_LEN];
-            let mut pacer = Pacer::new(stream.rate.map(|r| r.to_pps(frame.len())));
-            trace!("Tx stream #{i}: {} frames.", stream.count);
-            let mut remaining = stream.count;
-            while remaining > 0 {
+        for (i, pattern) in self.patterns.iter().enumerate() {
+            let frame_len = pattern.frames[0].len();
+            let burst_frames: Vec<&[u8]> = pattern.frames.iter().map(Vec::as_slice).collect();
+            let mut pacer = Pacer::new(pattern.rate.map(|r| r.to_pps(frame_len)));
+            let mut remaining = match pattern.count {
+                TxCount::Fixed(n) => Some(n),
+                TxCount::Continuous => None,
+            };
+            trace!(
+                "Tx pattern #{i}: {:?}, period {}.",
+                pattern.count,
+                burst_frames.len()
+            );
+            let mut sent_in_pattern: u64 = 0;
+            loop {
+                if remaining == Some(0) {
+                    break;
+                }
                 if signal::sigint_received() || self.stop.is_signaled() {
                     info!("Tx interrupted, {total} frames sent.");
                     return;
                 }
-                let n = pacer.grant(remaining.min(BURST_LEN as u64)) as usize;
+                let want = remaining
+                    .map(|r| r.min(BURST_LEN as u64))
+                    .unwrap_or(BURST_LEN as u64);
+                let n = pacer.grant(want) as usize;
                 if n == 0 {
                     std::hint::spin_loop();
                     continue;
                 }
-                if let Err(e) = self.port.write().unwrap().send_frames(&burst[..n]) {
-                    error!("Tx stream #{i} failed after {total} frames total: {e:#}");
+                let burst: Vec<&[u8]> = (0..n)
+                    .map(|j| burst_frames[(sent_in_pattern as usize + j) % burst_frames.len()])
+                    .collect();
+                if let Err(e) = self.port.write().unwrap().send_frames(&burst) {
+                    error!("Tx pattern #{i} failed after {total} frames total: {e:#}");
                     return;
                 }
-                remaining -= n as u64;
+                sent_in_pattern += n as u64;
                 total += n as u64;
-                self.counters.add_tx(n as u64, (n * frame.len()) as u64);
+                if let Some(r) = remaining.as_mut() {
+                    *r -= n as u64;
+                }
+                let bytes = (n * frame_len) as u64;
+                self.counters.add_tx(n as u64, bytes);
+                if let Some(flow_counters) = &pattern.flow_counters {
+                    flow_counters.add_tx(n as u64, bytes);
+                }
             }
         }
         info!("Tx succeed, {total} frames sent.");
