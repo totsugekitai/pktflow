@@ -60,6 +60,10 @@ int dpdk_port_start(dpdk_port_t *p);
 // Reads the link status without waiting for negotiation; *link_up is
 // set to 1 when the link is up, 0 otherwise.
 int dpdk_port_get_link(const dpdk_port_t *p, int *link_up);
+// Forces the link administratively up or down (up != 0 means up).
+// Not every PHY/driver supports this; unsupported returns a negative
+// DPDK errno.
+int dpdk_port_set_link(dpdk_port_t *p, int up);
 int dpdk_port_wait_linkup(dpdk_port_t *p);
 int dpdk_port_get_stats(const dpdk_port_t *p, dpdk_port_stats_t *stats);
 

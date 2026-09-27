@@ -132,6 +132,11 @@ int dpdk_port_get_link(const dpdk_port_t *p, int *link_up) {
         return 0;
 }
 
+int dpdk_port_set_link(dpdk_port_t *p, int up) {
+        return up ? rte_eth_dev_set_link_up(p->port_id)
+                  : rte_eth_dev_set_link_down(p->port_id);
+}
+
 int dpdk_port_wait_linkup(dpdk_port_t *p) {
         int ret;
         struct rte_eth_dev_info info;

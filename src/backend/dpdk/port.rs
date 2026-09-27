@@ -105,6 +105,17 @@ impl backend::Port for Port {
         Ok(up != 0)
     }
 
+    fn set_link(&mut self, up: bool) -> Result<()> {
+        let ret = unsafe { ffi::dpdk_port_set_link(self.ptr.as_ptr(), up as i32) };
+        if ret < 0 {
+            return Err(Error::msg(format!(
+                "Failed to set link {} ({ret})",
+                if up { "up" } else { "down" }
+            )));
+        }
+        Ok(())
+    }
+
     fn send_frames(&mut self, frames: &[&[u8]]) -> Result<()> {
         for chunk in frames.chunks(BURST_SIZE) {
             let mut burst = MbufBurst::<BURST_SIZE>::new();

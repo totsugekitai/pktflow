@@ -33,6 +33,7 @@ int dpdk_port_configure(
         const uint16_t nb_txq);
 int dpdk_port_start(dpdk_port_t *p);
 int dpdk_port_get_link(const dpdk_port_t *p, int *link_up);
+int dpdk_port_set_link(dpdk_port_t *p, int up);
 int dpdk_port_wait_linkup(dpdk_port_t *p);
 int dpdk_port_get_stats(const dpdk_port_t *p, dpdk_port_stats_t *stats);
 
